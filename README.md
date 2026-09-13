@@ -1,0 +1,2 @@
+# canary releases
+testing goreleaser
