@@ -307,6 +307,51 @@ for the `Authorization` header is committed in clear text in that file (three
 `proxy_set_header Authorization` lines). It should move to an environment
 variable or a mounted file and be rotated; the value is not reproduced here.
 
+### 2.9 Is netbird ready for `v0.71.5-canary.pr7450.3` today?
+
+Checked 2026-09-13 against `netbird@7914010`, `sign-pipelines@v0.1.8`, GoReleaser
+`v2.16.0` (the pinned version), the run history and assets of `v0.75.0-rc.6`
+(the last prerelease-shaped tag, 2026-07-13), and the source of the
+third-party actions on the path.
+
+| Component | Verdict | Evidence |
+| --- | --- | --- |
+| Four GoReleaser configs | ready | `goreleaser check` passes on all four; only deprecation warnings (`archives.builds`, `archives.format`, `nfpms.builds`, `brews`), which matter for a future v3 bump, not for v2.16. A scratch module tagged `v0.71.5-canary.pr7450.3` and released with `--skip=publish` yields `version=0.71.5-canary.pr7450.3`, `previous_tag=v0.71.4`, archives `netbird_0.71.5-canary.pr7450.3_{os}_{arch}.tar.gz` plus `_darwin_all`, packages `netbird_0.71.5-canary.pr7450.3_linux_amd64.{deb,rpm}` (so the `*amd64*.rpm` signature-verify glob still matches), a changelog from the previous tag, and a binary reporting the full version. `prerelease: auto` and `make_latest: false` are set in all four configs (added 2026-08-12, #7171). |
+| `release.yml` jobs | ready | `parse-semver` yields `fullversion=0.71.5`, `prerelease=canary.pr7450.3`, so `SKIP_PUBLISH` stays `true`, syso/MSI/NSIS versions stay numeric, and `trigger_signer` fires on the tag. This is the exact path run 29270579015 took for `v0.75.0-rc.6`: every job green, signer dispatched. |
+| `sign-pipelines` `v0.1.8` | ready | The `v0.75.0-rc.6` release carries the complete signed set (installer exe/msi for both arches, three pkgs, signed zips and tarballs). A canary differs only by the alphanumeric identifier `pr7450`, which the `parse-semver` regex `[0-9A-Za-z.-]+` accepts. `svenstaro/upload-release-action@2.11.5` with `overwrite: false` and no `promote` never touches `prerelease` or `make_latest` on an existing release; it would create a release with `make_latest=true` only if none existed, which the job ordering rules out. |
+| GoReleaser-created release | **never exercised** | Every netbird release so far was created by hand in the GitHub UI: the release `published_at` precedes the tag-push workflow runs by two seconds (`v0.78.1`, `v0.75.0-rc.6`), so GoReleaser has only ever uploaded into an existing release. An automated canary tag makes GoReleaser create the release itself (draft, upload, publish, all with `GITHUB_TOKEN`). Two consequences: `prerelease: auto` has never actually fired on netbird (all RCs predate #7171 and show `prerelease=false`), so Phase 1 must confirm it; and the `release: published` event will be raised by `GITHUB_TOKEN`, which starts no workflows, so `forum.yml` should stay quiet even without the guard below. |
+
+**Must change before the first canary tag** (all on the netbird side):
+
+1. `release_files/freebsd-port-diff.sh` and `freebsd-port-issue-body.sh`,
+   `fetch_all_tags`: the `grep -iv 'rc'` filter only removes RCs; a canary tag
+   passes and `sort -V | tail -1` selects it (reproduced: `0.78.2-canary.pr7450.3`
+   wins over `0.78.1`). Effect: **every** Release run, PRs and `main` included,
+   would generate a FreeBSD port diff for the canary and build it in the FreeBSD
+   VM for as long as the canary is among the newest tags. Fix: accept only
+   `v[0-9]+\.[0-9]+\.[0-9]+"` (no suffix) instead of filtering suffixes out.
+2. `update-docs.yml` runs on every `v*` tag (GitHub ignores `paths` filters
+   for tag pushes; it ran for `v0.75.0-rc.6`, run 29270578960) and dispatches
+   `generate api pages` in `netbirdio/docs`, which downloads `openapi.yml` from
+   `raw.githubusercontent.com/.../v<fullversion>/...`. For a canary
+   `fullversion` is `0.71.5`, a tag that does not exist yet, so the docs run
+   fails on a 404 body. Fix: `if: ${{ !contains(github.ref_name, '-') }}`,
+   the guard `sync-tag.yml` already uses. This also stops the RC noise.
+3. `forum.yml` posted a Discourse topic for `v0.75.0-rc.6` (run 29270579425)
+   because a UI-created release fires `release: published` as the human. Add
+   `if: ${{ !github.event.release.prerelease }}` so neither a hand-created
+   canary nor a future RC reaches the forum.
+4. `release.yml`: set `SKIP_DOCKER_PUSH=true` when `prerelease` starts with
+   `canary`. `dockers_v2.disable` also skips the multi-arch image builds, which
+   is most of the 13.5 minutes the GoReleaser step took in the RC run.
+
+Optional: skip `release_freebsd_port` and `release_ui_gtk3` for canary tags;
+gate the `.sig` push in `sign-pipelines` (4.2); `packages-proxy` `per_page` (2.8).
+
+**Confirm on the first canary run**: the release is `prerelease: true`;
+`releases/latest` unchanged; no forum topic; signer dispatched and all signed
+assets present; cleanup job removes release and tag.
+
 ### Comparison
 
 | | A: tag on netbird | B: canary repo | C: artifacts | D: rolling | E: in-repo signing |
@@ -609,10 +654,12 @@ docs/results.md                        the variant table from Phase 1 with run l
   `CANARY_TAG_TOKEN`, or A2 with `GITHUB_TOKEN` + `gh workflow run
   release.yml --ref`), then comment the future release URL on the PR. The
   existing Release workflow and `trigger_signer` do everything else.
-- `release.yml`: no functional change required. Recommended small edits:
-  `SKIP_DOCKER_PUSH=true` when `prerelease` starts with `canary` (GHCR `pr-N`
-  images already exist for PRs); skip `release_freebsd_port` and
-  `release_ui_gtk3` for canary tags; `workflow_dispatch:` if A2 is chosen.
+- The four fixes from 2.9 (FreeBSD tag filter, `update-docs.yml` guard,
+  `forum.yml` guard, `SKIP_DOCKER_PUSH` for canaries). Only the FreeBSD one
+  affects unrelated runs; the others limit side effects of the canary tag.
+- `release.yml`: no functional change required beyond that. Optional: skip
+  `release_freebsd_port` and `release_ui_gtk3` for canary tags;
+  `workflow_dispatch:` if A2 is chosen.
 - GoReleaser configs: `changelog.disable` templated on a `CANARY` env so
   canary releases do not carry a changelog since the last stable.
 - New `.github/workflows/canary-cleanup.yml`: on `pull_request: closed`
